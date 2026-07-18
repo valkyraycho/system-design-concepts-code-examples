@@ -1,105 +1,105 @@
-// Demonstrates the core claim in concepts/correlated-failure.md:
-// redundancy math assumes independent failures, but a real shared channel
-// (here: a config push that reaches every "redundant" node identically)
-// makes the true joint-failure rate collapse toward the shared cause's
-// probability instead of the tiny product the naive math predicts.
+// Demonstrates concepts/correlated-failure.md with a real mechanism: two
+// real net/http servers, each with its own independent per-request failure
+// roll, plus one real shared bool ("a config push landed") that both real
+// handlers check. Redundancy math assumes independence; this shows how
+// little it takes -- one shared read -- to make that assumption fiction.
 package main
 
 import (
 	"fmt"
 	"math/rand"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 )
 
 const (
-	numNodes = 2
-	numTrials = 50_000_000
-
-	// Probability a single node fails on its own on a given day (hardware,
-	// disk, whatever) -- independent per node.
-	pIndependentFailure = 0.001
-
-	// Probability a bad config/control-plane push ships on a given day.
-	// When it fires it reaches every node identically -- this is the
-	// channel the naive p^n formula doesn't know exists.
-	pSharedConfigPush = 0.0005
+	numTicks            = 100_000
+	pIndependentFailure = 0.02 // each node's own, unrelated failure roll per request
+	pSharedConfigPush   = 0.01 // probability a bad push is "in effect" for a given tick
 )
 
+// node is a real HTTP handler for one "redundant" server. Two nodes share
+// the same *badConfig pointer -- the one channel the naive p^n formula
+// doesn't know exists.
+type node struct {
+	name      string
+	badConfig *atomic.Bool
+}
+
+func (n *node) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if n.badConfig.Load() {
+		http.Error(w, "bad config on "+n.name, http.StatusInternalServerError)
+		return
+	}
+	if rand.Float64() < pIndependentFailure {
+		http.Error(w, "independent failure on "+n.name, http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
 func main() {
-	rng := rand.New(rand.NewSource(1))
-
-	naive := naiveJointFailureProbability()
-	independentOnly := monteCarlo(rng, false)
-	withSharedChannel := monteCarlo(rng, true)
-
-	printReport(naive, independentOnly, withSharedChannel)
-}
-
-func naiveJointFailureProbability() float64 {
-	p := 1.0
-	for range numNodes {
-		p *= pIndependentFailure
-	}
-	return p
-}
-
-func monteCarlo(rng *rand.Rand, includeSharedChannel bool) float64 {
-	failures := 0
-	for range numTrials {
-		if dayFails(rng, includeSharedChannel) {
-			failures++
-		}
-	}
-	return float64(failures) / float64(numTrials)
-}
-
-func dayFails(rng *rand.Rand, includeSharedChannel bool) bool {
-	if includeSharedChannel && rng.Float64() < pSharedConfigPush {
-		return true
-	}
-	down := 0
-	for range numNodes {
-		if rng.Float64() < pIndependentFailure {
-			down++
-		}
-	}
-	return down == numNodes
-}
-
-func printReport(naive, independentOnly, withSharedChannel float64) {
-	fmt.Println("=== Correlated failure: redundancy math vs reality ===")
-	fmt.Println()
-	fmt.Printf("Setup: %d \"redundant\" nodes\n", numNodes)
-	fmt.Printf("  Independent failure probability per node per day: %.4f%%\n", pIndependentFailure*100)
-	fmt.Printf("  Shared config-push failure probability per day:   %.4f%% (takes down every node identically)\n", pSharedConfigPush*100)
+	fmt.Println("=== Correlated failure: two real HTTP nodes, redundancy math vs reality ===")
 	fmt.Println()
 
+	naive := pIndependentFailure * pIndependentFailure
 	fmt.Println("--- Naive redundancy math (assumes independence) ---")
-	fmt.Printf("P(all %d fail) = p^%d = %.10f (%.6f%%)\n", numNodes, numNodes, naive, naive*100)
-	fmt.Printf("  -> expect a joint outage roughly once every %s\n", daysToHuman(1/naive))
+	fmt.Printf("P(both fail) = p^2 = %.6f (%.4f%%)\n", naive, naive*100)
 	fmt.Println()
 
-	fmt.Println("--- Monte Carlo, independent failures only (sanity check) ---")
-	fmt.Printf("Trials: %d\n", numTrials)
-	fmt.Printf("Empirical P(all fail) = %.10f (%.6f%%)\n", independentOnly, independentOnly*100)
+	fmt.Println("--- Scenario 1: two real nodes, independent failures only ---")
+	indepRate := pollNodes(false)
+	fmt.Printf("Empirical P(both fail) over %d real polls: %.6f (%.4f%%)\n", numTicks, indepRate, indepRate*100)
 	fmt.Println("  -> matches the naive math: this is the world redundancy math assumes.")
 	fmt.Println()
 
-	fmt.Println("--- Monte Carlo, WITH shared config-push channel ---")
-	fmt.Printf("Trials: %d\n", numTrials)
-	fmt.Printf("Empirical P(all fail) = %.10f (%.6f%%)\n", withSharedChannel, withSharedChannel*100)
-	fmt.Printf("  -> %.0fx more frequent than the naive math predicted\n", withSharedChannel/naive)
-	fmt.Printf("  -> expect a joint outage roughly once every %s\n", daysToHuman(1/withSharedChannel))
+	fmt.Println("--- Scenario 2: same two real nodes, WITH a shared config-push channel ---")
+	sharedRate := pollNodes(true)
+	fmt.Printf("Empirical P(both fail) over %d real polls: %.6f (%.4f%%)\n", numTicks, sharedRate, sharedRate*100)
+	fmt.Printf("  -> %.1fx more frequent than the naive math predicted\n", sharedRate/naive)
 	fmt.Println()
 
-	fmt.Println("Takeaway: adding a second \"redundant\" node barely moved the real number,")
-	fmt.Println("because node failures were never the dominant risk -- the shared config")
-	fmt.Println("pipeline was. Redundancy only pays for the risks it actually decorrelates.")
+	fmt.Println("Takeaway: same two real, independently-failing HTTP servers in both")
+	fmt.Println("scenarios. The only difference is one shared bool both handlers check --")
+	fmt.Println("and that alone is enough to make the redundancy math fiction.")
 }
 
-func daysToHuman(days float64) string {
-	years := days / 365
-	if years >= 1 {
-		return fmt.Sprintf("%.1f years", years)
+// pollNodes spins up two real HTTP servers and makes real requests to both,
+// numTicks times, counting how often BOTH real responses are failures.
+func pollNodes(includeSharedChannel bool) float64 {
+	var badConfig atomic.Bool
+
+	nodeA := httptest.NewServer(&node{name: "A", badConfig: &badConfig})
+	defer nodeA.Close()
+	nodeB := httptest.NewServer(&node{name: "B", badConfig: &badConfig})
+	defer nodeB.Close()
+
+	client := &http.Client{}
+	bothFailed := 0
+
+	for range numTicks {
+		if includeSharedChannel && rand.Float64() < pSharedConfigPush {
+			badConfig.Store(true)
+		}
+
+		aFailed := requestFails(client, nodeA.URL)
+		bFailed := requestFails(client, nodeB.URL)
+		if aFailed && bFailed {
+			bothFailed++
+		}
+
+		badConfig.Store(false)
 	}
-	return fmt.Sprintf("%.1f days", days)
+
+	return float64(bothFailed) / float64(numTicks)
+}
+
+func requestFails(client *http.Client, url string) bool {
+	resp, err := client.Get(url)
+	if err != nil {
+		return true
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode != http.StatusOK
 }
